@@ -191,3 +191,7 @@ Issues must be enabled in the fork for this maintainer notification.
 gh workflow run themisdb-upstream-review.yml --repo makr-code/llama.cpp \
   --ref themisdb -f validation_only=true
 ```
+
+## Validation-only updater candidate
+
+Automation smoke test run 45845844752. Current-base candidate only; no upstream update or promotion. **Do not merge this validation-only draft PR.**
