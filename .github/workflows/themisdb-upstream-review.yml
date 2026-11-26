@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "23 6 * * 1"
   workflow_dispatch:
+    inputs:
+      validation_only:
+        description: "Test current-base replay, CPU tests and draft PR only; do not update upstream"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ jobs:
       sha: ${{ steps.rebase.outputs.sha }}
       upstream: ${{ steps.rebase.outputs.upstream }}
       base: ${{ steps.rebase.outputs.base }}
+      validation_only: ${{ steps.rebase.outputs.validation_only }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -31,6 +37,8 @@ jobs:
       - name: Bound and rebase only fork patch commits
         id: rebase
         shell: bash
+        env:
+          VALIDATION_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_only }}
         run: |
           set -euo pipefail
           git config user.name "themisdb-upstream-review"
@@ -39,6 +47,15 @@ jobs:
           upstream=$(git rev-parse FETCH_HEAD)
           base=$(git rev-parse HEAD)
           ancestor=$(git merge-base HEAD "$upstream")
+          echo "Upstream master: $upstream; current patch ancestor: $ancestor; fork base: $base"
+          rebase_options=()
+          if [ "$VALIDATION_ONLY" = "true" ]; then
+            # Exercise a real replay and the unchanged build/publication path,
+            # but do not adopt newer upstream commits just to test automation.
+            upstream="$ancestor"
+            rebase_options=(--force-rebase)
+            echo "VALIDATION ONLY: replay onto current upstream ancestor; draft PR must not be merged."
+          fi
           export UPSTREAM="$upstream" BASE="$base" ANCESTOR="$ancestor"
           python3 - <<'PY'
           import os, pathlib, subprocess
@@ -61,18 +78,32 @@ jobs:
               if set(paths) - allowed:
                   raise SystemExit(f"Out-of-scope fork commit {commit}: {set(paths) - allowed}")
           PY
-          if [ "$ancestor" = "$upstream" ]; then
+          if [ "$ancestor" = "$upstream" ] && [ "$VALIDATION_ONLY" != "true" ]; then
             python3 -c 'import os; open(os.environ["GITHUB_OUTPUT"], "a").write("changed=false\n")'
             echo "No new upstream commits; no update PR needed."
             exit 0
           fi
           git switch -c themisdb-candidate
-          if ! timeout 180 git -c core.hooksPath=/dev/null rebase --onto "$upstream" "$ancestor"; then
+          if ! timeout 180 git -c core.hooksPath=/dev/null rebase "${rebase_options[@]}" --onto "$upstream" "$ancestor"; then
             echo "::error::Upstream rebase conflicted or timed out. No branch/PR published; resolve manually."
             git status --short
             git diff --name-only --diff-filter=U
             git rebase --abort || true
             exit 1
+          fi
+          if [ "$VALIDATION_ONLY" = "true" ]; then
+            # A documentation-only difference makes the smoke-test PR reviewable.
+            # No model artifact, training context or runtime code is added.
+            python3 - <<'PY'
+            import os
+            with open("docs/themisdb-training.md", "a") as out:
+                out.write("\n## Validation-only updater candidate\n\n"
+                          f"Automation smoke test run {os.environ['GITHUB_RUN_ID']}. "
+                          "Current-base replay only; no upstream update or promotion. "
+                          "**Do not merge this validation-only draft PR.**\n")
+            PY
+            git add docs/themisdb-training.md
+            git -c core.hooksPath=/dev/null commit -m "docs: mark validation-only updater candidate (do not merge)"
           fi
           sha=$(git rev-parse HEAD)
           export CANDIDATE_SHA="$sha"
@@ -80,7 +111,8 @@ jobs:
           import os
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               for key, val in (("changed", "true"), ("sha", os.environ["CANDIDATE_SHA"]),
-                               ("upstream", os.environ["UPSTREAM"]), ("base", os.environ["BASE"])):
+                               ("upstream", os.environ["UPSTREAM"]), ("base", os.environ["BASE"]),
+                               ("validation_only", os.environ["VALIDATION_ONLY"])):
                   out.write(f"{key}={val}\n")
           PY
           # Export code/history only, before running any upstream build logic.
@@ -141,6 +173,7 @@ jobs:
           BASE_SHA: ${{ needs.candidate.outputs.base }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_REPO: ${{ github.repository }}
+          VALIDATION_ONLY: ${{ needs.candidate.outputs.validation_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -151,11 +184,17 @@ jobs:
           git -c core.hooksPath=/dev/null fetch "$RUNNER_TEMP/candidate/themisdb-candidate.bundle" themisdb-candidate
           test "$(git rev-parse FETCH_HEAD)" = "$EXPECTED_SHA"
           branch="upstream-review/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          title="Review upstream llama.cpp update ${UPSTREAM_SHA:0:12}"
+          purpose="Rebased focused fork commits onto upstream master $UPSTREAM_SHA."
+          if [ "$VALIDATION_ONLY" = "true" ]; then
+            title="[Validation only] updater CPU tests and draft-PR smoke test"
+            purpose="VALIDATION ONLY: replayed the existing patch onto current upstream ancestor $UPSTREAM_SHA. No newer upstream commits adopted. Do not merge or promote this draft PR."
+          fi
           gh auth setup-git
           git -c core.hooksPath=/dev/null push origin "$EXPECTED_SHA:refs/heads/$branch"
           gh pr create --repo "$GH_REPO" --base themisdb --head "$branch" --draft \
-            --title "Review upstream llama.cpp update ${UPSTREAM_SHA:0:12}" \
-            --body "Rebased focused fork commits onto upstream master $UPSTREAM_SHA.
+            --title "$title" \
+            --body "$purpose
 
           Candidate: $EXPECTED_SHA; previous themisdb: $BASE_SHA.
           Evidence: $RUN_URL (Release CPU build target test-lora-train and CTest lora-train passed before this PR).
