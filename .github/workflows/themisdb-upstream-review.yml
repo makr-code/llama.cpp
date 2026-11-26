@@ -28,6 +28,7 @@ jobs:
       upstream: ${{ steps.rebase.outputs.upstream }}
       base: ${{ steps.rebase.outputs.base }}
       validation_only: ${{ steps.rebase.outputs.validation_only }}
+      conflicts: ${{ steps.rebase.outputs.conflicts }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -59,6 +60,8 @@ jobs:
           export UPSTREAM="$upstream" BASE="$base" ANCESTOR="$ancestor"
           python3 - <<'PY'
           import os, pathlib, subprocess
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"upstream={os.environ['UPSTREAM']}\nbase={os.environ['BASE']}\n")
           ancestor = os.environ["ANCESTOR"]
           allowed = {
               "include/llama.h", "src/llama-adapter.cpp", "src/llama-context.cpp",
@@ -88,23 +91,30 @@ jobs:
             echo "::error::Upstream rebase conflicted or timed out. No branch/PR published; resolve manually."
             git status --short
             git diff --name-only --diff-filter=U
+            python3 - <<'PY'
+          import json, os, subprocess
+          conflicts = subprocess.check_output(
+              ["git", "diff", "--name-only", "--diff-filter=U"], text=True).splitlines()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write("conflicts=" + json.dumps(conflicts) + "\n")
+          PY
             git rebase --abort || true
             exit 1
           fi
-          if [ "$VALIDATION_ONLY" = "true" ]; then
-            # A documentation-only difference makes the smoke-test PR reviewable.
-            # No model artifact, training context or runtime code is added.
-            python3 - <<'PY'
-            import os
+          # A documentation-only difference makes the smoke-test PR reviewable.
+          # No model artifact, training context or runtime code is added.
+          python3 - <<'PY'
+          import os, subprocess
+          if os.environ["VALIDATION_ONLY"] == "true":
             with open("docs/themisdb-training.md", "a") as out:
                 out.write("\n## Validation-only updater candidate\n\n"
                           f"Automation smoke test run {os.environ['GITHUB_RUN_ID']}. "
                           "Current-base replay only; no upstream update or promotion. "
                           "**Do not merge this validation-only draft PR.**\n")
-            PY
-            git add docs/themisdb-training.md
-            git -c core.hooksPath=/dev/null commit -m "docs: mark validation-only updater candidate (do not merge)"
-          fi
+            subprocess.run(["git", "add", "docs/themisdb-training.md"], check=True)
+            subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "commit", "-m",
+                            "docs: mark validation-only updater candidate (do not merge)"], check=True)
+          PY
           sha=$(git rev-parse HEAD)
           export CANDIDATE_SHA="$sha"
           python3 - <<'PY'
@@ -204,3 +214,44 @@ jobs:
         if: failure()
         run: |
           echo "::error::Draft PR publication failed. Check logs and repository workflow PR-creation permission; a candidate branch may exist. No automatic merge."
+
+  report-blocked:
+    needs: candidate
+    if: failure() && needs.candidate.result == 'failure'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Report actual conflicts or validation failure to maintainers
+        # No checkout or candidate code on this runner; issue-write only.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          UPSTREAM_SHA: ${{ needs.candidate.outputs.upstream }}
+          BASE_SHA: ${{ needs.candidate.outputs.base }}
+          CONFLICTS_JSON: ${{ needs.candidate.outputs.conflicts }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          repo = os.environ["GH_REPO"]
+          title = "[ThemisDB updater] upstream update blocked"
+          conflicts = json.loads(os.environ["CONFLICTS_JSON"] or "[]")
+          details = ("Actual rebase conflicts:\n" + "\n".join(f"- `{path}`" for path in conflicts)
+                     if conflicts else "Fetch, scope, timeout or candidate build/test failure; see failed step logs.")
+          body = (f"Updater blocked: {os.environ['RUN_URL']}\n\n"
+                  f"Upstream target: `{os.environ['UPSTREAM_SHA'] or 'unavailable'}`\n"
+                  f"Fork base: `{os.environ['BASE_SHA'] or 'unavailable'}`\n\n{details}\n\n"
+                  "No update branch or draft PR was published by this failed candidate job. "
+                  "No automatic merge or promotion. Human review/intervention is required.")
+          issues = json.loads(subprocess.check_output(
+              ["gh", "issue", "list", "--repo", repo, "--state", "open", "--search", title,
+               "--json", "number,title"], text=True))
+          existing = next((issue for issue in issues if issue["title"] == title), None)
+          if existing:
+              command = ["gh", "issue", "comment", str(existing["number"]), "--repo", repo, "--body", body]
+          else:
+              command = ["gh", "issue", "create", "--repo", repo, "--title", title, "--body", body]
+          subprocess.run(command, check=True)
+          PY

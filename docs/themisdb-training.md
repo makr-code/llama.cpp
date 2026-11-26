@@ -154,6 +154,13 @@ only a documentation smoke-test marker; its PR title/body explicitly say
 **validation only — do not merge or promote**. Scheduled updates cannot select
 this mode and still fail closed on real upstream conflicts.
 
+Candidate failures also run a separate fresh-runner, `issues: write`-only
+reporting job. It creates or comments on the open `[ThemisDB updater] upstream
+update blocked` issue with actual rebase-conflict filenames, upstream/fork SHAs
+when available, and the failed run link. No checkout or candidate script runs
+with that job's issue token. A failed reporting API call remains a visible
+workflow failure; the existing annotations and summary are retained.
+
 ```sh
 gh workflow run themisdb-upstream-review.yml --repo makr-code/llama.cpp \
   --ref themisdb -f validation_only=true
