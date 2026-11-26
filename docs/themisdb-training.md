@@ -21,7 +21,7 @@ were imported. No parent repository content or model artifacts are included.
    loss reduction, frozen base weights and export/reload parity.
 3. Build and run focused CPU tests before publication.
 4. Add reviewed weekly upstream-update automation in a separate commit:
-   candidate rebase, tests, draft PR; no automatic merge.
+   candidate upstream merge, tests, draft PR; no automatic merge.
 
 Acceptance is real optimizer updates, not a simulated training path. CPU fixture
 success does not establish GPU, all-architecture or production-model quality.
@@ -119,9 +119,12 @@ On Windows this internal-inspection test requires a static build.
 or manually on default branch `themisdb`. Only that workflow should be enabled
 in the fork; inherited workflows/schedules must remain disabled.
 
-The read-only candidate job fetches public upstream master, checks a bounded,
-linear series of at most 32 commits against an explicit focused-file allowlist,
-and rebases with a 180-second timeout. Conflicts or scope/build/test failures
+The read-only candidate job fetches public upstream master and checks the net
+fork delta relative to the shared upstream ancestor against an explicit
+focused-file allowlist. It branches from the current `themisdb` HEAD and merges
+upstream into that candidate with a 180-second timeout. Existing merge history
+is valid; upstream changes introduced by a reviewed prior merge are not
+misclassified as local patch files. Conflicts or scope/build/test failures
 produce explicit diagnostics and prevent publication. It builds and runs the
 focused Release CPU regression **before** transferring candidate code/history.
 The artifact is a git bundle only; generated models/training context are excluded.
@@ -130,25 +133,47 @@ A separate fresh-runner publication job has `contents: write` and
 `pull-requests: write`. Both checkouts use `actions/checkout@v5` with
 `persist-credentials: false`. GH_TOKEN is exposed only to the final push/PR step;
 no candidate build runs with write credentials. It checks the tested candidate
-SHA and unchanged base, pushes a unique review branch and opens a **draft** PR
+SHA, unchanged base and candidate ancestry (both fork base and upstream target
+must be ancestors), pushes a unique review branch and opens a **draft** PR
 to `themisdb`. It never automatically merges or force-updates `themisdb`.
 
 GITHUB_TOKEN-created PRs do not trigger ordinary PR workflows: review the linked
-pre-PR run, and rerun validation after edits. Evidence covers only the focused
-fixture. Preserve a linear patch series when manually promoting the reviewed
-candidate; ordinary merge commits will intentionally block subsequent rebases
-until a maintainer linearizes the series. Revisit the file allowlist for reviewed
-future patch changes. Upstream workflow-file changes may require additional
+pre-PR run, and rerun validation after edits or base changes. Evidence covers only
+the focused fixture. Revisit the file allowlist for reviewed future patch changes.
+Upstream workflow-file changes may require additional
 GitHub publication authorization; do not introduce a job-wide PAT as a workaround.
 Repository Actions settings may also need “Allow GitHub Actions to create and
 approve pull requests”; publication failure explicitly reports this boundary.
+
+### Maintainer promotion (real updates only)
+
+The candidate is a descendant of the tested `themisdb` base, not a rebased
+replacement history. After reviewing the diff, exact candidate SHA and linked
+test run, mark the **real upstream update** draft ready and approve it according
+to repository policy. Verify that neither the base nor candidate changed since
+validation. Promote with GitHub's **Create a merge commit**, never squash/rebase:
+
+```sh
+# Inspect before approving; N and TESTED_SHA come from the reviewed real PR.
+gh pr view N --repo makr-code/llama.cpp --json isDraft,headRefOid,baseRefName,body
+gh pr ready N --repo makr-code/llama.cpp
+gh pr merge N --repo makr-code/llama.cpp --merge --match-head-commit TESTED_SHA
+```
+
+These are maintainer commands, not workflow steps. No `--auto`, force-push,
+automatic approval or automatic promotion is configured. The normal merge
+retains the upstream merge as ancestry; the next run finds the newly merged
+upstream ancestor and checks only the remaining net fork patch. When base/head
+changes require new evidence, regenerate and retest a fresh candidate before
+promotion. Do **not** apply these commands to validation-only smoke-test PRs.
 
 ### Manual runtime validation
 
 `workflow_dispatch` offers `validation_only` (boolean, default false). In this
 explicit manual mode the workflow fetches upstream to identify the fork's current
-shared upstream ancestor, then force-replays the focused patch onto **that same
-ancestor**, not newer upstream. The regular CPU build, focused tests, bundle
+shared upstream ancestor, then merges **that same ancestor** into a candidate
+branched from `themisdb` (an intentional no-op, not a newer upstream update).
+The regular CPU build, focused tests, bundle
 transfer and separate draft-PR publication jobs still run. The candidate adds
 only a documentation smoke-test marker; its PR title/body explicitly say
 **validation only — do not merge or promote**. Scheduled updates cannot select
@@ -156,10 +181,11 @@ this mode and still fail closed on real upstream conflicts.
 
 Candidate failures also run a separate fresh-runner, `issues: write`-only
 reporting job. It creates or comments on the open `[ThemisDB updater] upstream
-update blocked` issue with actual rebase-conflict filenames, upstream/fork SHAs
+update blocked` issue with actual merge-conflict filenames, upstream/fork SHAs
 when available, and the failed run link. No checkout or candidate script runs
 with that job's issue token. A failed reporting API call remains a visible
 workflow failure; the existing annotations and summary are retained.
+Issues must be enabled in the fork for this maintainer notification.
 
 ```sh
 gh workflow run themisdb-upstream-review.yml --repo makr-code/llama.cpp \
