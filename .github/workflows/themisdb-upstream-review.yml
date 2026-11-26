@@ -1,0 +1,167 @@
+name: ThemisDB reviewed upstream update
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: themisdb-upstream-review
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    if: github.repository == 'makr-code/llama.cpp' && github.ref == 'refs/heads/themisdb'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      changed: ${{ steps.rebase.outputs.changed }}
+      sha: ${{ steps.rebase.outputs.sha }}
+      upstream: ${{ steps.rebase.outputs.upstream }}
+      base: ${{ steps.rebase.outputs.base }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: themisdb
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bound and rebase only fork patch commits
+        id: rebase
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "themisdb-upstream-review"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          timeout 180 git fetch --no-tags https://github.com/ggml-org/llama.cpp.git master
+          upstream=$(git rev-parse FETCH_HEAD)
+          base=$(git rev-parse HEAD)
+          ancestor=$(git merge-base HEAD "$upstream")
+          export UPSTREAM="$upstream" BASE="$base" ANCESTOR="$ancestor"
+          python3 - <<'PY'
+          import os, pathlib, subprocess
+          ancestor = os.environ["ANCESTOR"]
+          allowed = {
+              "include/llama.h", "src/llama-adapter.cpp", "src/llama-context.cpp",
+              "src/llama-context.h", "src/llama-graph.cpp", "src/llama-graph.h",
+              "src/models/llama.cpp", "tests/CMakeLists.txt", "tests/test-lora-train.cpp",
+              "docs/themisdb-training.md", ".github/workflows/themisdb-upstream-review.yml",
+          }
+          commits = subprocess.check_output(["git", "rev-list", f"{ancestor}..HEAD"], text=True).splitlines()
+          if not commits or len(commits) > 32:
+              raise SystemExit("Expected 1..32 focused fork commits; maintainer intervention required.")
+          for commit in commits:
+              parents = subprocess.check_output(["git", "show", "-s", "--format=%P", commit], text=True).split()
+              if len(parents) != 1:
+                  raise SystemExit("Nonlinear fork history: review and linearize the patch series manually.")
+              paths = subprocess.check_output(
+                  ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit], text=True).splitlines()
+              if set(paths) - allowed:
+                  raise SystemExit(f"Out-of-scope fork commit {commit}: {set(paths) - allowed}")
+          PY
+          if [ "$ancestor" = "$upstream" ]; then
+            python3 -c 'import os; open(os.environ["GITHUB_OUTPUT"], "a").write("changed=false\n")'
+            echo "No new upstream commits; no update PR needed."
+            exit 0
+          fi
+          git switch -c themisdb-candidate
+          if ! timeout 180 git -c core.hooksPath=/dev/null rebase --onto "$upstream" "$ancestor"; then
+            echo "::error::Upstream rebase conflicted or timed out. No branch/PR published; resolve manually."
+            git status --short
+            git diff --name-only --diff-filter=U
+            git rebase --abort || true
+            exit 1
+          fi
+          sha=$(git rev-parse HEAD)
+          export CANDIDATE_SHA="$sha"
+          python3 - <<'PY'
+          import os
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              for key, val in (("changed", "true"), ("sha", os.environ["CANDIDATE_SHA"]),
+                               ("upstream", os.environ["UPSTREAM"]), ("base", os.environ["BASE"])):
+                  out.write(f"{key}={val}\n")
+          PY
+          # Export code/history only, before running any upstream build logic.
+          git bundle create "$RUNNER_TEMP/themisdb-candidate.bundle" themisdb-candidate "^$ancestor"
+      - name: Build CPU training regression (no write credentials)
+        if: steps.rebase.outputs.changed == 'true'
+        run: |
+          cmake -S . -B build-review -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_HTTPLIB=OFF -DLLAMA_OPENSSL=OFF -DGGML_CCACHE=OFF \
+            -DGGML_NATIVE=OFF -DGGML_CPU_REPACK=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DGGML_BLAS=OFF
+          cmake --build build-review --target test-lora-train --parallel 2
+          ctest --test-dir build-review --no-tests=error -R '^lora-train$' --output-on-failure
+      - name: Transfer tested candidate code only
+        if: steps.rebase.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: themisdb-candidate
+          path: ${{ runner.temp }}/themisdb-candidate.bundle
+          if-no-files-found: error
+          retention-days: 7
+      - name: Explicit failure evidence
+        if: failure()
+        run: |
+          echo "::error::Candidate fetch/scope/rebase/build/test failed. No update branch or PR is published."
+          python3 - <<'PY'
+          import os
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              out.write("## Upstream update blocked\nSee failed step logs for fetch, scope, conflict or test evidence. "
+                        "No candidate promotion or automatic merge occurred. Human intervention is required.\n")
+          PY
+
+  publish:
+    needs: candidate
+    if: needs.candidate.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: themisdb
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: themisdb-candidate
+          path: ${{ runner.temp }}/candidate
+      - name: Publish tested candidate and draft review PR
+        # A fresh runner: no upstream candidate scripts execute with this token.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ needs.candidate.outputs.sha }}
+          UPSTREAM_SHA: ${{ needs.candidate.outputs.upstream }}
+          BASE_SHA: ${{ needs.candidate.outputs.base }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE_SHA" || {
+            echo "::error::themisdb moved during validation; rerun instead of publishing stale evidence."
+            exit 1
+          }
+          git -c core.hooksPath=/dev/null fetch "$RUNNER_TEMP/candidate/themisdb-candidate.bundle" themisdb-candidate
+          test "$(git rev-parse FETCH_HEAD)" = "$EXPECTED_SHA"
+          branch="upstream-review/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh auth setup-git
+          git -c core.hooksPath=/dev/null push origin "$EXPECTED_SHA:refs/heads/$branch"
+          gh pr create --repo "$GH_REPO" --base themisdb --head "$branch" --draft \
+            --title "Review upstream llama.cpp update ${UPSTREAM_SHA:0:12}" \
+            --body "Rebased focused fork commits onto upstream master $UPSTREAM_SHA.
+
+          Candidate: $EXPECTED_SHA; previous themisdb: $BASE_SHA.
+          Evidence: $RUN_URL (Release CPU build target test-lora-train and CTest lora-train passed before this PR).
+
+          GITHUB_TOKEN-created PRs do not trigger normal PR workflows. This evidence covers only the generated F32/Q4_0 dense-Llama fixture, not GPUs, other architectures, production model quality or ThemisDB integration. Review code and workflow changes manually; rerun validation after edits. Preserve a linear patch history when promoting the candidate. No automatic merge."
+      - name: Report publication/permission failure
+        if: failure()
+        run: |
+          echo "::error::Draft PR publication failed. Check logs and repository workflow PR-creation permission; a candidate branch may exist. No automatic merge."
