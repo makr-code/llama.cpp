@@ -142,3 +142,19 @@ future patch changes. Upstream workflow-file changes may require additional
 GitHub publication authorization; do not introduce a job-wide PAT as a workaround.
 Repository Actions settings may also need “Allow GitHub Actions to create and
 approve pull requests”; publication failure explicitly reports this boundary.
+
+### Manual runtime validation
+
+`workflow_dispatch` offers `validation_only` (boolean, default false). In this
+explicit manual mode the workflow fetches upstream to identify the fork's current
+shared upstream ancestor, then force-replays the focused patch onto **that same
+ancestor**, not newer upstream. The regular CPU build, focused tests, bundle
+transfer and separate draft-PR publication jobs still run. The candidate adds
+only a documentation smoke-test marker; its PR title/body explicitly say
+**validation only — do not merge or promote**. Scheduled updates cannot select
+this mode and still fail closed on real upstream conflicts.
+
+```sh
+gh workflow run themisdb-upstream-review.yml --repo makr-code/llama.cpp \
+  --ref themisdb -f validation_only=true
+```
