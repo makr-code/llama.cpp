@@ -18,10 +18,17 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
     using inp_attn_type = std::conditional_t<embed, llm_graph_input_attn_no_cache, llm_graph_input_attn_kv>;
 
     inp_attn_type * inp_attn = nullptr;
+    llm_graph_input_attn_no_cache * inp_attn_train = nullptr;
     if constexpr (embed) {
         inp_attn = build_attn_inp_no_cache();
     } else {
-        inp_attn = build_attn_inp_kv();
+        if (train_lora_only) {
+            // Cache reads are detached from projection writes, severing K/V
+            // gradients. opt_init requires one complete sequence per step.
+            inp_attn_train = build_attn_inp_no_cache();
+        } else {
+            inp_attn = build_attn_inp_kv();
+        }
     }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
@@ -88,9 +95,15 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
                 cb(Qcur, "Qcur_normed", il);
                 cb(Kcur, "Kcur_normed", il);
             }
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].bo,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            if (inp_attn_train) {
+                cur = build_attn(inp_attn_train,
+                        model.layers[il].wo, model.layers[il].bo,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            } else {
+                cur = build_attn(inp_attn,
+                        model.layers[il].wo, model.layers[il].bo,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            }
             cb(cur, "attn_out", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {

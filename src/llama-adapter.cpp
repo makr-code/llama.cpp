@@ -5,7 +5,11 @@
 #include "llama-model.h"
 
 #include <map>
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstring>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 
@@ -430,6 +434,240 @@ llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * p
     }
 
     return nullptr;
+}
+
+//
+// ThemisDB patch 0001: trainable LoRA adapters
+//
+
+static bool llama_adapter_str_endswith(const std::string & str, const char * suffix) {
+    const size_t n = strlen(suffix);
+    return str.size() >= n && str.compare(str.size() - n, n, suffix) == 0;
+}
+
+// LoRA tensors must not live in CPU "extra" buffer types (repacked weights); fall back to the plain CPU buffer type
+static ggml_backend_buffer_type_t llama_adapter_lora_select_buft(const ggml_tensor * model_tensor) {
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        throw std::runtime_error(format("%s: no CPU backend found", __func__));
+    }
+    auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+    auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra_bufts) {
+        for (ggml_backend_buffer_type_t * extra = get_extra_bufts(cpu_dev); extra && *extra; ++extra) {
+            if (*extra == buft) {
+                return ggml_backend_dev_buffer_type(cpu_dev);
+            }
+        }
+    }
+    return buft;
+}
+
+bool llama_lora_target_filter_attn_mlp(const ggml_tensor * tensor, void * /*userdata*/) {
+    if (!tensor || ggml_n_dims(tensor) != 2) {
+        return false;
+    }
+    const std::string name(tensor->name);
+    if (name.rfind("blk.", 0) != 0) {
+        return false;
+    }
+    static const char * suffixes[] = {
+        ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_qkv.weight", ".attn_output.weight",
+        ".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight",
+    };
+    for (const char * suffix : suffixes) {
+        if (llama_adapter_str_endswith(name, suffix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void llama_adapter_lora_init_trainable_impl(
+        llama_model            & model,
+        int32_t                  rank,
+        float                    alpha,
+        uint32_t                 seed,
+        llama_opt_param_filter   target_filter,
+        void                   * target_filter_ud,
+        llama_adapter_lora     & adapter) {
+    if (rank < 1) {
+        throw std::runtime_error("rank must be >= 1");
+    }
+    if (!(alpha > 0.0f) || !std::isfinite(alpha)) {
+        throw std::runtime_error("alpha must be a finite value > 0");
+    }
+    if (!target_filter) {
+        throw std::runtime_error("target_filter must not be NULL");
+    }
+
+    // sorted targets make tensor creation and initialisation independent of model load order
+    std::vector<std::pair<std::string, const ggml_tensor *>> targets;
+    for (const auto & it : model.tensors_by_name) {
+        const ggml_tensor * t = it.second;
+        if (!t || ggml_n_dims(t) != 2 || it.first == "token_embd.weight" || !target_filter(t, target_filter_ud)) {
+            continue;
+        }
+        if (rank > t->ne[0] || rank > t->ne[1]) {
+            throw std::runtime_error(format("rank %d exceeds the dimensions of '%s'", rank, it.first.c_str()));
+        }
+        targets.emplace_back(it.first, t);
+    }
+    if (targets.empty()) {
+        throw std::runtime_error("target_filter matched no 2D base weight");
+    }
+    std::sort(targets.begin(), targets.end(), [](const auto & x, const auto & y) { return x.first < y.first; });
+
+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it != ctx_map.end()) {
+            return it->second;
+        }
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2*targets.size()*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr buft_ctx { ggml_init(params) };
+        if (!buft_ctx) {
+            throw std::runtime_error("failed to create ggml context for lora adapter");
+        }
+        ggml_context * ctx = buft_ctx.get();
+        adapter.ctxs.emplace_back(std::move(buft_ctx));
+        ctx_map[buft] = ctx;
+        return ctx;
+    };
+
+    for (const auto & target : targets) {
+        const ggml_tensor * w = target.second;
+        ggml_context * ctx = ctx_for_buft(llama_adapter_lora_select_buft(w));
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], rank);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, w->ne[1]);
+        ggml_set_name(a, (target.first + ".lora_a").c_str());
+        ggml_set_name(b, (target.first + ".lora_b").c_str());
+        adapter.ab_map[target.first] = llama_adapter_lora_weight(a, b);
+    }
+
+    for (auto & it : ctx_map) {
+        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(it.second, it.first) };
+        if (!buf) {
+            throw std::runtime_error("failed to allocate buffer for lora adapter");
+        }
+        LLAMA_LOG_INFO("%s: %10s trainable LoRA buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
+        adapter.bufs.emplace_back(std::move(buf));
+    }
+
+    // std::mt19937 output is fully specified; std::uniform_real_distribution is not, so map the bits explicitly
+    std::mt19937 rng(seed);
+    std::vector<float> host;
+    for (const auto & target : targets) {
+        const llama_adapter_lora_weight & lw = adapter.ab_map.at(target.first);
+        const float bound = 1.0f / std::sqrt((float) lw.a->ne[0]);
+        host.resize(ggml_nelements(lw.a));
+        for (float & v : host) {
+            const float u = (float) (rng() >> 8) * (1.0f / 16777216.0f);
+            v = (2.0f*u - 1.0f) * bound;
+        }
+        ggml_backend_tensor_set(lw.a, host.data(), 0, ggml_nbytes(lw.a));
+        host.assign(ggml_nelements(lw.b), 0.0f);
+        ggml_backend_tensor_set(lw.b, host.data(), 0, ggml_nbytes(lw.b));
+    }
+
+    LLM_KV llm_kv = LLM_KV(LLM_ARCH_UNKNOWN);
+    adapter.alpha = alpha;
+    adapter.gguf_kv[llm_kv(LLM_KV_GENERAL_TYPE)]         = "adapter";
+    adapter.gguf_kv[llm_kv(LLM_KV_GENERAL_ARCHITECTURE)] = llm_arch_name(model.arch);
+    adapter.gguf_kv[llm_kv(LLM_KV_ADAPTER_TYPE)]         = "lora";
+    adapter.gguf_kv[llm_kv(LLM_KV_ADAPTER_LORA_ALPHA)]   = format("%f", alpha);
+
+    model.loras.insert(&adapter);
+
+    LLAMA_LOG_INFO("%s: created trainable lora adapter: %zu tensor pairs, rank %d, alpha %.3f\n",
+            __func__, targets.size(), rank, alpha);
+}
+
+llama_adapter_lora * llama_adapter_lora_init_trainable(
+        llama_model            * model,
+        int32_t                  rank,
+        float                    alpha,
+        uint32_t                 seed,
+        llama_opt_param_filter   target_filter,
+        void                   * target_filter_ud) {
+    if (!model) {
+        LLAMA_LOG_ERROR("%s: model must not be NULL\n", __func__);
+        return nullptr;
+    }
+    try {
+        auto adapter = std::make_unique<llama_adapter_lora>();
+        llama_adapter_lora_init_trainable_impl(*model, rank, alpha, seed, target_filter, target_filter_ud, *adapter);
+        return adapter.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to create trainable lora adapter: %s\n", __func__, err.what());
+    }
+    return nullptr;
+}
+
+bool llama_adapter_lora_save(const llama_adapter_lora * adapter, const llama_model * model, const char * path_lora) {
+    if (!adapter || !model || !path_lora || !path_lora[0] || adapter->ab_map.empty() || !model->loras.count(
+                const_cast<llama_adapter_lora *>(adapter))) {
+        LLAMA_LOG_ERROR("%s: adapter, model and path must be set and the adapter must not be empty\n", __func__);
+        return false;
+    }
+    try {
+        std::vector<std::pair<std::string, const ggml_tensor *>> tensors;
+        tensors.reserve(2*adapter->ab_map.size());
+        for (const auto & it : adapter->ab_map) {
+            tensors.emplace_back(it.first + ".lora_a", it.second.a);
+            tensors.emplace_back(it.first + ".lora_b", it.second.b);
+        }
+        std::sort(tensors.begin(), tensors.end(), [](const auto & x, const auto & y) { return x.first < y.first; });
+
+        size_t mem_size = ggml_tensor_overhead();
+        for (const auto & t : tensors) {
+            mem_size += ggml_tensor_overhead() + GGML_PAD(ggml_nbytes(t.second), GGML_MEM_ALIGN);
+        }
+        ggml_init_params params = {
+            /*.mem_size   =*/ mem_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ false,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        gguf_context_ptr gguf { gguf_init_empty() };
+        if (!ctx || !gguf) {
+            throw std::runtime_error("failed to allocate host context");
+        }
+
+        LLM_KV llm_kv = LLM_KV(LLM_ARCH_UNKNOWN);
+        gguf_set_val_str(gguf.get(), llm_kv(LLM_KV_GENERAL_TYPE).c_str(),         "adapter");
+        gguf_set_val_str(gguf.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str(), llm_arch_name(model->arch));
+        gguf_set_val_str(gguf.get(), llm_kv(LLM_KV_ADAPTER_TYPE).c_str(),         "lora");
+        gguf_set_val_f32(gguf.get(), llm_kv(LLM_KV_ADAPTER_LORA_ALPHA).c_str(),   adapter->alpha);
+        if (!adapter->alora_invocation_tokens.empty()) {
+            const std::vector<uint32_t> tokens(adapter->alora_invocation_tokens.begin(), adapter->alora_invocation_tokens.end());
+            gguf_set_arr_data(gguf.get(), llm_kv(LLM_KV_ADAPTER_ALORA_INVOCATION_TOKENS).c_str(),
+                    GGUF_TYPE_UINT32, tokens.data(), tokens.size());
+        }
+
+        for (const auto & t : tensors) {
+            ggml_tensor * dst = ggml_dup_tensor(ctx.get(), t.second);
+            ggml_set_name(dst, t.first.c_str());
+            ggml_backend_tensor_get(t.second, dst->data, 0, ggml_nbytes(t.second));
+            gguf_add_tensor(gguf.get(), dst);
+        }
+
+        if (!gguf_write_to_file(gguf.get(), path_lora, /*only_meta =*/ false)) {
+            throw std::runtime_error(format("failed to write '%s'", path_lora));
+        }
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to save lora adapter: %s\n", __func__, err.what());
+    }
+    return false;
 }
 
 int32_t llama_adapter_meta_val_str(const llama_adapter_lora * adapter, const char * key, char * buf, size_t buf_size) {
