@@ -557,9 +557,15 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // Full-sequence LoRA optimization must retain the K/V projection graph.
+    bool train_lora_only = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (train_lora_only != other.train_lora_only) {
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -699,6 +705,8 @@ using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_
 
 struct llm_graph_context {
     const llm_arch arch;
+
+    const bool train_lora_only;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;

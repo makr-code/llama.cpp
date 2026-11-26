@@ -329,6 +329,7 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    bool train_lora_only = false;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

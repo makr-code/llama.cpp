@@ -814,6 +814,7 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
+    train_lora_only  (params.train_lora_only),
     hparams          (params.hparams),
     cparams          (params.cparams),
     ubatch           (params.ubatch),

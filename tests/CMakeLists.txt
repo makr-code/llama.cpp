@@ -1,5 +1,15 @@
 llama_add_compile_flags()
 
+# Standalone synthetic fixture; no common/get-model or network dependency.
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    add_executable(test-lora-train test-lora-train.cpp)
+    target_compile_features(test-lora-train PRIVATE cxx_std_17)
+    target_include_directories(test-lora-train PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-lora-train PRIVATE llama ggml)
+    add_test(NAME lora-train COMMAND test-lora-train)
+    set_tests_properties(lora-train PROPERTIES LABELS "training" TIMEOUT 180)
+endif()
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 

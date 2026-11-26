@@ -2749,6 +2749,25 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
+    GGML_ASSERT(model == &this->model);
+    GGML_ASSERT(lopt_params.param_filter);
+    train_lora_only = lopt_params.train_lora_only;
+    if (train_lora_only) {
+        GGML_ASSERT(model->arch == LLM_ARCH_LLAMA && model->hparams.n_expert == 0);
+        GGML_ASSERT(cparams.causal_attn);
+        // No truncated/detached KV history: each step sees a complete sequence.
+        GGML_ASSERT(lopt_params.n_ctx_train == 0 || lopt_params.n_ctx_train == n_ctx());
+        GGML_ASSERT(n_ubatch() >= n_ctx() && n_batch() >= n_ctx());
+        // Parameter flags live on model/adapter tensors, not on the context.
+        // Clear stale flags from a previous optimization context.
+        for (const auto & it : model->tensors_by_name) {
+            // CPU OUT_PROD backward expects ordinary quantized storage, not
+            // inference-only repacked buffers. F16/BF16 OUT_PROD is unsupported.
+            GGML_ASSERT(ggml_backend_buffer_get_type(it.second->buffer) == ggml_backend_cpu_buffer_type());
+            GGML_ASSERT(it.second->type == GGML_TYPE_F32 || ggml_is_quantized(it.second->type));
+            it.second->flags &= ~GGML_TENSOR_FLAG_PARAM;
+        }
+    }
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
@@ -2764,6 +2783,28 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
+
+    if (lopt_params.train_lora_only) {
+        size_t n_params = 0;
+        for (const auto & it : loras) {
+            GGML_ASSERT(model->loras.count(it.first));
+            GGML_ASSERT(it.second != 0.0f && std::isfinite(it.second));
+            GGML_ASSERT(it.first->alora_invocation_tokens.empty());
+            for (const auto & ab : it.first->ab_map) {
+                for (ggml_tensor * t : { ab.second.a, ab.second.b }) {
+                    GGML_ASSERT(ggml_backend_buffer_get_type(t->buffer) == ggml_backend_cpu_buffer_type());
+                    t->flags &= ~GGML_TENSOR_FLAG_PARAM;
+                    llama_set_param(t, param_filter, param_filter_ud);
+                    n_params += (t->flags & GGML_TENSOR_FLAG_PARAM) ? 1 : 0;
+                }
+            }
+        }
+        if (n_params == 0) {
+            GGML_ABORT("train_lora_only requires at least one attached F32 LoRA adapter tensor accepted by param_filter");
+        }
+        LLAMA_LOG_INFO("%s: training %zu LoRA adapter tensors, base model frozen\n", __func__, n_params);
+        return;
+    }
 
   //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
     llama_set_param(model->type_embd,       param_filter, param_filter_ud);
@@ -2853,7 +2894,12 @@ void llama_context::opt_epoch_iter(
 
             auto * res = gf_res_prev.get();
 
-            const auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_DEFAULT);
+            auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_DEFAULT);
+            gparams.train_lora_only = train_lora_only;
+            if (train_lora_only) {
+                // GGML has no FLASH_ATTN_EXT backward implementation.
+                gparams.cparams.flash_attn = false;
+            }
 
             res->reset();
 

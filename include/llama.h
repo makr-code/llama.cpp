@@ -1548,6 +1548,21 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+
+        /// Train only attached F32 LoRA tensors accepted by param_filter; freeze
+        /// all base tensors, including any previously marked parameters.
+        /// Dense Llama only: causal attention, n_batch and n_ubatch >= n_ctx,
+        /// n_ctx_train == 0 or n_ctx, CPU model/adapter buffers (build with
+        /// GGML_CPU_REPACK=OFF, n_gpu_layers=0), F32 or quantized base weights.
+        /// F16/BF16 base weights are unsupported by CPU OUT_PROD backward.
+        /// Uses full-sequence F32 cache-free attention
+        /// with flash attention disabled during optimization (inference unchanged).
+        /// Aborts on invalid configuration, null param_filter, zero/nonfinite
+        /// adapter scale, aLoRA, or no qualifying F32 adapter tensor.
+        /// Model/adapter parameter flags are shared: exclusive access to model
+        /// and adapters is required for the entire optimizer context lifetime.
+        /// Zero-initialized callers retain upstream behavior.
+        bool train_lora_only;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1560,6 +1575,59 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    //
+    // ThemisDB patch 0001: trainable LoRA adapters
+    //
+
+#define LLAMA_THEMIS_TRAINABLE_LORA 1
+
+    /// @brief Select 2D attention/MLP projection weights of repeating blocks.
+    /// @param tensor Borrowed base tensor; NULL returns false. Names must be
+    /// blk.N.attn_{q,k,v,qkv,output}.weight or blk.N.ffn_{gate,up,down}.weight.
+    /// @param userdata Ignored; may be NULL.
+    /// @return False for norms, embeddings, MoE experts and non-2D tensors.
+    /// @note This is a base-target filter, not an optimizer parameter filter:
+    /// optimizer tensors have .lora_a/.lora_b suffixes. Use
+    /// llama_opt_param_filter_all to train both adapter components.
+    LLAMA_API bool llama_lora_target_filter_attn_mlp(const struct ggml_tensor * tensor, void * userdata);
+
+    /// @brief Create model-owned F32 LoRA pairs with random A and zero B (no-op).
+    /// @param model Borrowed, loaded model with allocated tensor buffers.
+    /// @param rank Positive rank, no greater than either selected weight dimension.
+    /// @param alpha Finite positive LoRA scaling numerator (effective scale alpha/rank).
+    /// @param seed Deterministic mt19937 seed; sorted targets and explicit bit mapping.
+    /// @param target_filter Non-NULL borrowed callback accepting 2D base weights.
+    /// token_embd.weight is excluded because its adapter layout differs.
+    /// @param target_filter_ud Borrowed callback data, used only during this call.
+    /// @return Model-owned adapter, or NULL on invalid arguments, no targets or
+    /// recoverable allocation failure. Errors are logged; failed adapters are not registered.
+    /// @note Call before creating the using context. The model must outlive all
+    /// contexts and owns the returned adapter; do not delete it. Serialize access
+    /// against model/adapter mutation. GGML fatal allocation errors may abort.
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_trainable(
+            struct llama_model     * model,
+            int32_t                  rank,
+            float                    alpha,
+            uint32_t                 seed,
+            llama_opt_param_filter   target_filter,
+            void                   * target_filter_ud);
+
+    /// @brief Export adapter weights in sorted-name order to a reloadable GGUF.
+    /// @param adapter Borrowed nonempty adapter owned by model.
+    /// @param model Borrowed owning model; supplies architecture metadata.
+    /// @param path_lora Nonempty output path; an existing file is overwritten.
+    /// @return True on success; false (logged) on invalid arguments or recoverable
+    /// allocation/I/O failure. A failed write can leave a partial output file.
+    /// @note Caller must synchronize all training/async writes before saving and
+    /// serialize mutation of the adapter. Export is synchronous, not atomic.
+    /// Only general.type/architecture, adapter.type/lora.alpha and aLoRA invocation
+    /// tokens are exported; arbitrary metadata is not preserved. Identical tensors
+    /// and metadata produce identical bytes on the same GGUF implementation/platform.
+    LLAMA_API bool llama_adapter_lora_save(
+            const struct llama_adapter_lora * adapter,
+            const struct llama_model        * model,
+            const char                      * path_lora);
 
 #ifdef __cplusplus
 }
