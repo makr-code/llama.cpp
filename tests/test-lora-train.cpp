@@ -104,7 +104,7 @@ using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
 static model_ptr load(const std::string & path) {
     auto params = llama_model_default_params();
     params.n_gpu_layers = 0;
-    params.use_mmap = false;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
     return model_ptr(llama_model_load_from_file(path.c_str(), params), llama_model_free);
 }
 
@@ -119,17 +119,18 @@ static context_ptr context(llama_model * model) {
 
 static std::vector<float> logits(llama_context * ctx) {
     llama_memory_clear(llama_get_memory(ctx), true);
-    llama_batch batch = llama_batch_init(8, 0, 1);
+    std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> batch(
+            llama_batch_ext_init(ctx), llama_batch_ext_free);
+    check(bool(batch), "batch allocation");
     for (int i = 0; i < 8; ++i) {
-        batch.token[i] = i % 16;
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = true;
+        const int32_t idx = llama_batch_ext_add_token(batch.get(), 0, i % 16);
+        check(idx >= 0, "batch add token");
+        const llama_pos pos = i;
+        check(llama_batch_ext_set_pos(batch.get(), idx, &pos), "batch set position");
+        check(llama_batch_ext_set_output_logits(batch.get(), idx, true), "batch set logits");
     }
-    batch.n_tokens = 8;
-    const int rc = llama_decode(ctx, batch);
-    llama_batch_free(batch);
+    const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    batch.reset();
     check(rc == 0, "decode");
     const float * data = llama_get_logits(ctx);
     return { data, data + 8*16 };
@@ -149,7 +150,7 @@ static bool reject(const ggml_tensor *, void *) { return false; }
 static llama_adapter_lora * observed = nullptr;
 static int gradient_steps = 0;
 static std::map<ggml_tensor *, std::vector<float>> previous;
-static constexpr float learning_rate = 0.1f;
+static constexpr float learning_rate = 0.01f;
 static constexpr int epochs = 64;
 static void gradients(bool train, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
         int64_t, int64_t, int64_t) {
@@ -209,6 +210,10 @@ static void run(const temp_dir & dir, bool quantized) {
     check(!create(2, 2, nullptr) && !create(2, 2, reject), "invalid filter accepted");
     check(!llama_adapter_lora_init_trainable(nullptr, 2, 2, 123, reject, nullptr), "null model");
     check(model->loras.size() == count, "failed init registered an adapter");
+    auto * disposable = create(2, 2, llama_lora_target_filter_attn_mlp);
+    check(disposable && model->loras.size() == count + 1, "register trainable adapter");
+    llama_adapter_lora_free(disposable);
+    check(model->loras.size() == count, "free must unregister trainable adapter");
     auto * adapter = create(2, 2, llama_lora_target_filter_attn_mlp);
     auto * twin = create(2, 2, llama_lora_target_filter_attn_mlp);
     check(adapter && twin && adapter->ab_map.size() == 14, "target count");
@@ -232,7 +237,8 @@ static void run(const temp_dir & dir, bool quantized) {
     wrong_model.reset();
 
     auto ctx = context(model.get());
-    check(bool(ctx) && llama_set_adapter_lora(ctx.get(), adapter, 1.0f) == 0, "attach");
+    float scale = 1.0f;
+    check(bool(ctx) && llama_set_adapters_lora(ctx.get(), &adapter, 1, &scale) == 0, "attach");
     near(base_logits, logits(ctx.get()));
     llama_opt_params params {};
     params.param_filter = llama_opt_param_filter_all;
@@ -301,8 +307,8 @@ static void run(const temp_dir & dir, bool quantized) {
     check(file_bytes(save1) == file_bytes(save2), "save/load byte parity");
     auto original_ctx = context(model.get()), restored_ctx = context(model.get());
     check(bool(original_ctx) && bool(restored_ctx), "parity contexts");
-    check(llama_set_adapter_lora(original_ctx.get(), adapter, 1.0f) == 0, "attach trained");
-    check(llama_set_adapter_lora(restored_ctx.get(), restored, 1.0f) == 0, "attach restored");
+    check(llama_set_adapters_lora(original_ctx.get(), &adapter, 1, &scale) == 0, "attach trained");
+    check(llama_set_adapters_lora(restored_ctx.get(), &restored, 1, &scale) == 0, "attach restored");
     const auto trained_logits = logits(original_ctx.get());
     near(trained_logits, logits(restored_ctx.get()));
     check(trained_logits != base_logits, "training did not affect inference");

@@ -1,7 +1,7 @@
 ---
 AI_Used: true
 AI_Models: unknown
-AI_Contributor: OpenAI API assistant
+AI_Contributor: GitHub Copilot
 Human_Review: false
 Human_Author: makr-code
 ---
@@ -10,7 +10,8 @@ Human_Author: makr-code
 
 ## Bounded implementation plan
 
-Base: `1e8924fd65ad349d1d838412a2172292618f3bbf` (b7974).
+Original base: `1e8924fd65ad349d1d838412a2172292618f3bbf` (b7974).
+This repair merges upstream `0e4e925e8fa3d784b39f450050511576a0c8869b`.
 Only the authorized public API, adapter implementation and optimizer changes
 were imported. No parent repository content or model artifacts are included.
 
@@ -33,6 +34,17 @@ llama.cpp training contract; native upstream ownership conventions take preceden
 AI assisted this patch and narrative; exact model backend is not independently
 verifiable. Human review remains required before upstream update promotion.
 
+## Future GPU training goal
+
+GPU training is not supported or validated by this repair. A future implementation
+must provide real device-backed Attention and MLP LoRA gradients while keeping
+base weights frozen, and demonstrate CPU/GPU numerical and gradient parity.
+Qualify Vulkan first, then CUDA. Each backend requires real backward and optimizer
+kernel coverage, parity tests and evidence from actual devices.
+Unsupported devices, operators and backend failures must produce explicit errors,
+not silently fall back to CPU. GPU kernels, backend support and acceptance tests
+are future work; no GPU training functionality is claimed here.
+
 ## Supported training contract
 
 The capability macro is exactly `#define LLAMA_THEMIS_TRAINABLE_LORA 1`.
@@ -53,7 +65,9 @@ The public functions are documented in `include/llama.h`.
   matches base names, not `.lora_a/.lora_b` optimizer tensor names.
 - The training graph uses the existing no-cache causal attention path. This
   preserves Q/K/V gradients instead of reading detached inference cache tensors.
-  Flash attention is disabled in optimization only. Inference is unchanged.
+  Flash attention is disabled in optimization only. The full-sequence mask must
+  not require KV padding: upstream PAD lacks a backward implementation and the
+  training path asserts rather than dropping gradients. Inference is unchanged.
 - Do not change attachments/scales or concurrently access the model/adapters
   during the optimizer context lifetime: parameter flags are shared on tensors.
   aLoRA training is rejected. Destroy the training context before using separate
@@ -81,7 +95,7 @@ cmake --build build --target test-lora-train --parallel 2
 ctest --test-dir build --no-tests=error -R '^lora-train$' --output-on-failure
 ```
 
-The test uses 64 real SGD steps, learning rate 0.1 and no weight decay/momentum.
+The test uses 64 real SGD steps, learning rate 0.01 and no weight decay/momentum.
 Because dynamic upstream `ggml_opt_eval` discards its graph before the epoch
 callback, `ggml_opt_grad_acc` cannot safely be used there. The test instead checks
 the applied loss gradient as `(previous - updated) / learning_rate`, for every
@@ -98,20 +112,28 @@ trained tensor parity and reloaded inference logits.
 
 Local validation on 2026-11-26:
 
-- MSVC 19.44 / Ninja / Windows Release: build passed; `lora-train` passed.
-  Loss F32: 2.493383 -> 2.382294; Q4_0: 2.423965 -> 2.333972.
-- GCC 13.3 / Ninja / WSL Ubuntu Debug: build and `lora-train` passed.
-- GCC 13.3 / Ninja / WSL Ubuntu Release: build and `lora-train` passed.
-- Focused workflow actionlint and `git diff --check` passed.
+- Original b7974 patch: MSVC 19.44 Windows Release and GCC 13.3 WSL Ubuntu
+  Debug and Release focused tests passed.
+- Upstream merge repair: MSVC 19.44 / Ninja / Windows Release and GCC 13.3 /
+  Ninja / WSL Ubuntu Release built and passed `lora-train` twice each.
+  Linux loss F32: 2.493383 -> 0.641579; Q4_0: 2.423965 -> 0.668955.
+  The former 0.1 SGD rate diverged for Q4_0 after the upstream merge; the loss
+  decrease threshold and all gradient checks remain unchanged at 0.01.
 
 The installed VS Insiders vcvars script failed to set VC include/library paths.
 Windows validation used its SDK environment with explicit installed MSVC 14.44
 include/library paths in the same process. Initial intermediate tests exposed
 detached cache inputs, invalid dynamic-gradient accessor use and repacked-buffer
 restrictions; those failures were investigated, not treated as passing evidence.
-SGD 0.5 was unstable on the quantized fixture; 0.1 passed the unchanged loss gate.
+The original patch also observed instability at SGD 0.5.
 No GPU, sanitizer, production-model quality or full upstream suite is claimed.
 On Windows this internal-inspection test requires a static build.
+
+Upstream replaced individual adapter attachment/removal APIs with
+`llama_set_adapters_lora` (which replaces the entire attached set) and replaced
+model loading booleans such as `use_mmap` and `use_mlock` with `load_mode`.
+Consumers must migrate those calls before repinning; the ThemisDB trainable
+LoRA declarations remain present.
 
 ## Reviewed upstream automation
 
