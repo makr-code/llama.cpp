@@ -119,17 +119,18 @@ static context_ptr context(llama_model * model) {
 
 static std::vector<float> logits(llama_context * ctx) {
     llama_memory_clear(llama_get_memory(ctx), true);
-    llama_batch batch = llama_batch_init(8, 0, 1);
+    std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> batch(
+            llama_batch_ext_init(ctx), llama_batch_ext_free);
+    check(bool(batch), "batch allocation");
     for (int i = 0; i < 8; ++i) {
-        batch.token[i] = i % 16;
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = true;
+        const int32_t idx = llama_batch_ext_add_token(batch.get(), 0, i % 16);
+        check(idx >= 0, "batch add token");
+        const llama_pos pos = i;
+        check(llama_batch_ext_set_pos(batch.get(), idx, &pos), "batch set position");
+        check(llama_batch_ext_set_output_logits(batch.get(), idx, true), "batch set logits");
     }
-    batch.n_tokens = 8;
-    const int rc = llama_decode(ctx, batch);
-    llama_batch_free(batch);
+    const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    batch.reset();
     check(rc == 0, "decode");
     const float * data = llama_get_logits(ctx);
     return { data, data + 8*16 };
